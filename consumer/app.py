@@ -6,7 +6,7 @@ from typing import Dict, Set, List
 from pathlib import Path
 
 from confluent_kafka import Consumer, KafkaError, KafkaException
-from confluent_kafka.admin import AdminClient
+from confluent_kafka.admin import AdminClient, NewTopic
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.schema_registry import Schema
@@ -101,11 +101,44 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 
 # ---------- KAFKA SETUP ---------- #
+def ensure_topic_exists(admin_client: AdminClient, topic_name: str):
+    """
+    Verify the Kafka topic exists. Log a warning if it doesn't.
+    Consumer shouldn't create topics, but should verify they exist.
+    
+    Args:
+        admin_client: Kafka AdminClient instance
+        topic_name: Name of the topic to verify
+    """
+    try:
+        # Get existing topics
+        metadata = admin_client.list_topics(timeout=10)
+        existing_topics = metadata.topics
+        
+        if topic_name in existing_topics:
+            print(f"[Consumer] Topic '{topic_name}' exists and is ready")
+            topic_metadata = existing_topics[topic_name]
+            num_partitions = len(topic_metadata.partitions)
+            print(f"[Consumer] Topic '{topic_name}' has {num_partitions} partition(s)")
+        else:
+            print(f"[Consumer] WARNING: Topic '{topic_name}' does not exist yet. It will be created on first producer message.")
+                
+    except Exception as e:
+        print(f"[Consumer] Error checking topic existence: {e}")
+        # Don't raise - consumer can still subscribe and wait for topic creation
+
+
 def init_kafka_consumer():
     """Initialize Kafka consumer and schema registry client."""
     global kafka_consumer, schema_registry_client, avro_deserializer
     
     try:
+        # Initialize AdminClient first to verify topic
+        admin_client = AdminClient({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS})
+        
+        # Verify topic exists (consumer doesn't create it)
+        ensure_topic_exists(admin_client, ORDER_TOPIC)
+        
         # Initialize Schema Registry client
         schema_registry_client = SchemaRegistryClient({
             'url': SCHEMA_REGISTRY_URL
@@ -143,7 +176,6 @@ def init_kafka_consumer():
         kafka_consumer.subscribe([ORDER_TOPIC])
         
         # Verify connection
-        admin_client = AdminClient({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS})
         metadata = admin_client.list_topics(timeout=10)
         print(f"[Consumer] Connected to Kafka successfully, subscribed to topic: {ORDER_TOPIC}")
         

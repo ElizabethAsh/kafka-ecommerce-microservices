@@ -6,8 +6,8 @@ import json
 from typing import Dict, Optional
 from pathlib import Path
 
-from confluent_kafka import Producer, KafkaError
-from confluent_kafka.admin import AdminClient
+from confluent_kafka import Producer, KafkaError, KafkaException
+from confluent_kafka.admin import AdminClient, NewTopic
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer
 from confluent_kafka.schema_registry import Schema
@@ -112,11 +112,66 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 
 # ---------- KAFKA SETUP ---------- #
+def ensure_topic_exists(admin_client: AdminClient, topic_name: str, num_partitions: int = 3, replication_factor: int = 1):
+    """
+    Ensure the Kafka topic exists. Create it if it doesn't.
+    
+    Args:
+        admin_client: Kafka AdminClient instance
+        topic_name: Name of the topic to create/verify
+        num_partitions: Number of partitions (default: 3 for parallelism)
+        replication_factor: Replication factor (default: 1 for single broker)
+    """
+    try:
+        # Get existing topics
+        metadata = admin_client.list_topics(timeout=10)
+        existing_topics = metadata.topics
+        
+        if topic_name in existing_topics:
+            print(f"[Producer] Topic '{topic_name}' already exists")
+            return
+        
+        # Topic doesn't exist, create it
+        print(f"[Producer] Creating topic '{topic_name}' with {num_partitions} partitions...")
+        
+        new_topic = NewTopic(
+            topic=topic_name,
+            num_partitions=num_partitions,
+            replication_factor=replication_factor,
+            config={
+                'retention.ms': '604800000',  # 7 days in milliseconds
+                'min.insync.replicas': '1',    # Minimum replicas that must acknowledge
+            }
+        )
+        
+        # Create topic (returns a dict of futures)
+        futures = admin_client.create_topics([new_topic])
+        
+        # Wait for topic creation to complete
+        for topic, future in futures.items():
+            try:
+                future.result()  # Block until topic is created
+                print(f"[Producer] Topic '{topic}' created successfully")
+            except Exception as e:
+                print(f"[Producer] Failed to create topic '{topic}': {e}")
+                raise
+                
+    except Exception as e:
+        print(f"[Producer] Error ensuring topic exists: {e}")
+        raise
+
+
 def init_kafka_producer():
     """Initialize Kafka producer and schema registry client."""
     global kafka_producer, schema_registry_client, avro_serializer
     
     try:
+        # Initialize AdminClient first to check/create topic
+        admin_client = AdminClient({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS})
+        
+        # Ensure topic exists with proper configuration
+        ensure_topic_exists(admin_client, ORDER_TOPIC, num_partitions=3, replication_factor=1)
+        
         # Initialize Schema Registry client
         schema_registry_client = SchemaRegistryClient({
             'url': SCHEMA_REGISTRY_URL
@@ -152,8 +207,7 @@ def init_kafka_producer():
         
         kafka_producer = Producer(producer_config)
         
-        # Verify connection by checking if we can get metadata
-        admin_client = AdminClient({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS})
+        # Verify connection
         metadata = admin_client.list_topics(timeout=10)
         print(f"[Producer] Connected to Kafka successfully")
         
@@ -260,7 +314,14 @@ def validate_update_request(body: UpdateOrderRequest) -> None:
 
 
 def publish_order_event(order: dict):
-    """Publish order event to Kafka using Avro serialization."""
+    """
+    Publish order event to Kafka using Avro serialization.
+    
+    Raises:
+        HTTPException(400): For data/serialization errors
+        HTTPException(503): For transient network/broker errors
+        HTTPException(500): For unexpected errors
+    """
     global kafka_producer, avro_serializer
     
     ensure_kafka_connection()
@@ -270,24 +331,71 @@ def publish_order_event(order: dict):
         key = order["orderId"].encode('utf-8')
         
         # Serialize order using Avro
-        serialized_value = avro_serializer(order, SerializationContext(ORDER_TOPIC, MessageField.VALUE))
+        try:
+            serialized_value = avro_serializer(order, SerializationContext(ORDER_TOPIC, MessageField.VALUE))
+        except (TypeError, ValueError, KeyError) as serialization_error:
+            # Data validation or schema mismatch errors
+            print(f"[Producer] Serialization error: {serialization_error}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Bad Request: Failed to serialize order data. The data does not match the Avro schema: {str(serialization_error)}"
+            )
+        except Exception as serialization_error:
+            # Other serialization errors (schema issues, etc.)
+            print(f"[Producer] Avro serialization error: {serialization_error}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Bad Request: Invalid order data format: {str(serialization_error)}"
+            )
         
         # Produce message
-        kafka_producer.produce(
-            topic=ORDER_TOPIC,
-            key=key,
-            value=serialized_value,
-            callback=delivery_callback
-        )
+        try:
+            kafka_producer.produce(
+                topic=ORDER_TOPIC,
+                key=key,
+                value=serialized_value,
+                callback=delivery_callback
+            )
+            
+            # Flush to ensure message is sent
+            kafka_producer.flush(timeout=10)
+            
+        except BufferError as buffer_error:
+            # Queue is full - transient error
+            print(f"[Producer] Buffer full error: {buffer_error}")
+            raise HTTPException(
+                status_code=503,
+                detail="Service Unavailable: Message queue is full. Please try again in a moment."
+            )
+        except KafkaException as kafka_error:
+            # Kafka-specific errors (broker unreachable, etc.)
+            error_code = kafka_error.args[0].code() if kafka_error.args else None
+            
+            # Check if it's a retriable error
+            if error_code in (KafkaError._MSG_TIMED_OUT, KafkaError.REQUEST_TIMED_OUT, 
+                             KafkaError._TRANSPORT, KafkaError.NETWORK_EXCEPTION):
+                print(f"[Producer] Transient Kafka error: {kafka_error}")
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Service Unavailable: Kafka broker temporarily unreachable. Error: {str(kafka_error)}"
+                )
+            else:
+                # Non-retriable Kafka error
+                print(f"[Producer] Kafka error: {kafka_error}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Internal error: Kafka operation failed: {str(kafka_error)}"
+                )
         
-        # Flush to ensure message is sent
-        kafka_producer.flush(timeout=10)
-        
+    except HTTPException:
+        # Re-raise HTTPExceptions as-is
+        raise
     except Exception as e:
-        print(f"[Producer] Error publishing message: {e}")
+        # Unexpected errors
+        print(f"[Producer] Unexpected error publishing message: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Internal error: failed to publish order event to Kafka. Error: {str(e)}"
+            detail=f"Internal error: An unexpected error occurred while publishing the order event: {str(e)}"
         )
 
 
