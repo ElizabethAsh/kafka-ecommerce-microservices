@@ -1,4 +1,5 @@
 import os
+import json
 import threading
 import time
 from typing import Dict, Set, List
@@ -16,8 +17,32 @@ from fastapi.responses import JSONResponse
 
 # Load Avro schema from file
 SCHEMA_FILE = Path(__file__).parent / "order.avsc"
-with open(SCHEMA_FILE, 'r') as f:
-    ORDER_SCHEMA = f.read()
+try:
+    with open(SCHEMA_FILE, 'r') as f:
+        ORDER_SCHEMA = f.read()
+    
+    # Validate it's valid JSON
+    json.loads(ORDER_SCHEMA)
+    
+    if not ORDER_SCHEMA.strip():
+        raise ValueError("Schema file is empty")
+        
+    print(f"[Consumer] Successfully loaded Avro schema from {SCHEMA_FILE}")
+    
+except FileNotFoundError:
+    raise FileNotFoundError(
+        f"Avro schema file not found at {SCHEMA_FILE}. "
+        "Make sure order.avsc exists in the same directory as app.py"
+    )
+except json.JSONDecodeError as e:
+    raise ValueError(
+        f"Invalid JSON in schema file {SCHEMA_FILE}: {e}. "
+        "Please check the schema file format."
+    )
+except Exception as e:
+    raise RuntimeError(
+        f"Failed to load Avro schema from {SCHEMA_FILE}: {e}"
+    )
 
 # Kafka configuration
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
@@ -85,9 +110,17 @@ def init_kafka_consumer():
         schema_registry_client = SchemaRegistryClient({
             'url': SCHEMA_REGISTRY_URL
         })
+        print(f"[Consumer] Connected to Schema Registry at {SCHEMA_REGISTRY_URL}")
         
         # Parse schema string to Schema object
-        schema_obj = Schema(ORDER_SCHEMA, schema_type='AVRO')
+        try:
+            schema_obj = Schema(ORDER_SCHEMA, schema_type='AVRO')
+            print(f"[Consumer] Avro schema validated successfully")
+        except Exception as schema_error:
+            print(f"[Consumer] Invalid Avro schema: {schema_error}")
+            raise ValueError(
+                f"Failed to parse Avro schema. The schema may be invalid: {schema_error}"
+            )
         
         # Create Avro deserializer
         avro_deserializer = AvroDeserializer(
@@ -114,6 +147,9 @@ def init_kafka_consumer():
         metadata = admin_client.list_topics(timeout=10)
         print(f"[Consumer] Connected to Kafka successfully, subscribed to topic: {ORDER_TOPIC}")
         
+    except ValueError:
+        # Re-raise schema validation errors
+        raise
     except Exception as e:
         print(f"[Consumer] Failed to initialize Kafka: {e}")
         raise
