@@ -1,0 +1,65 @@
+{
+  "type": "record",
+  "name": "Order",
+  "namespace": "com.ecommerce.order",
+  "fields": [
+    {
+      "name": "orderId",
+      "type": "string",
+      "doc": "Unique identifier for the order"
+    },
+    {
+      "name": "customerId",
+      "type": "string",
+      "doc": "Unique identifier for the customer"
+    },
+    {
+      "name": "orderDate",
+      "type": "string",
+      "doc": "Timestamp in ISO 8601 format"
+    },
+    {
+      "name": "items",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "OrderItem",
+          "fields": [
+            {
+              "name": "itemId",
+              "type": "string",
+              "doc": "Unique identifier for the item"
+            },
+            {
+              "name": "quantity",
+              "type": "int",
+              "doc": "Quantity of the item (must be greater than 0)"
+            },
+            {
+              "name": "price",
+              "type": "double",
+              "doc": "Price of a single unit of the item"
+            }
+          ]
+        }
+      },
+      "doc": "Array of order items"
+    },
+    {
+      "name": "totalAmount",
+      "type": "double",
+      "doc": "Total cost of the order (must equal the sum of item prices * quantities)"
+    },
+    {
+      "name": "currency",
+      "type": "string",
+      "doc": "Currency code (e.g., USD, EUR)"
+    },
+    {
+      "name": "status",
+      "type": "string",
+      "doc": "Status of the order (e.g., 'pending', 'confirmed', 'shipped', 'delivered', 'cancelled')"
+    }
+  ]
+}

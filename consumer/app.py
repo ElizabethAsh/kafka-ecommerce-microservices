@@ -2,6 +2,7 @@ import os
 import threading
 import time
 from typing import Dict, Set, List
+from pathlib import Path
 
 from confluent_kafka import Consumer, KafkaError, KafkaException
 from confluent_kafka.admin import AdminClient
@@ -12,6 +13,11 @@ from confluent_kafka.serialization import SerializationContext, MessageField
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+
+# Load Avro schema from file
+SCHEMA_FILE = Path(__file__).parent / "order.avsc"
+with open(SCHEMA_FILE, 'r') as f:
+    ORDER_SCHEMA = f.read()
 
 # Kafka configuration
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
@@ -32,38 +38,6 @@ order_database: Dict[str, dict] = {}
 topic_order_ids: Dict[str, Set[str]] = {}
 # Lock to ensure thread-safe access
 db_lock = threading.Lock()
-
-# Avro schema for Order (must match producer)
-ORDER_SCHEMA = """
-{
-  "type": "record",
-  "name": "Order",
-  "namespace": "com.ecommerce",
-  "fields": [
-    {"name": "orderId", "type": "string"},
-    {"name": "customerId", "type": "string"},
-    {"name": "orderDate", "type": "string"},
-    {
-      "name": "items",
-      "type": {
-        "type": "array",
-        "items": {
-          "type": "record",
-          "name": "OrderItem",
-          "fields": [
-            {"name": "itemId", "type": "string"},
-            {"name": "quantity", "type": "int"},
-            {"name": "price", "type": "double"}
-          ]
-        }
-      }
-    },
-    {"name": "totalAmount", "type": "double"},
-    {"name": "currency", "type": "string"},
-    {"name": "status", "type": "string"}
-  ]
-}
-"""
 
 
 # ---------- CUSTOM ERROR HANDLERS ---------- #
