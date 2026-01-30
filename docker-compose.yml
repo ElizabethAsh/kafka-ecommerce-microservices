@@ -82,6 +82,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
       ORDER_TOPIC: order-events
+      DLQ_TOPIC: order-events-dlq
     networks:
       - ecommerce-network
     restart: unless-stopped
@@ -103,6 +104,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
       ORDER_TOPIC: order-events
+      DLQ_TOPIC: order-events-dlq
       CONSUMER_GROUP_ID: order-service-consumer
     networks:
       - ecommerce-network

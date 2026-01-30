@@ -3,7 +3,7 @@ import random
 import string
 import time
 import json
-from typing import Dict, Optional
+from typing import Optional, List
 from pathlib import Path
 
 from confluent_kafka import Producer, KafkaError, KafkaException
@@ -50,6 +50,7 @@ except Exception as e:
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 SCHEMA_REGISTRY_URL = os.getenv("SCHEMA_REGISTRY_URL", "http://schema-registry:8081")
 ORDER_TOPIC = os.getenv("ORDER_TOPIC", "order-events")
+DLQ_TOPIC = os.getenv("DLQ_TOPIC", "order-events-dlq")
 
 app = FastAPI(title="Cart Service - Producer")
 
@@ -57,9 +58,6 @@ app = FastAPI(title="Cart Service - Producer")
 kafka_producer: Optional[Producer] = None
 schema_registry_client: Optional[SchemaRegistryClient] = None
 avro_serializer: Optional[AvroSerializer] = None
-
-# In-memory storage for orders (to support update-order endpoint)
-order_database: Dict[str, dict] = {}
 
 CURRENCIES = ["USD", "EUR", "ILS", "GBP"]
 
@@ -70,6 +68,10 @@ class CreateOrderRequest(BaseModel):
 
 
 class UpdateOrderRequest(BaseModel):
+    """
+    Update order status request.
+    The status field must NOT be 'new' (reserved for create operations).
+    """
     orderId: str
     status: str
 
@@ -161,16 +163,68 @@ def ensure_topic_exists(admin_client: AdminClient, topic_name: str, num_partitio
         raise
 
 
+def ensure_topic_exists_dlq(admin_client: AdminClient, topic_name: str, num_partitions: int = 1, replication_factor: int = 1):
+    """
+    Ensure the DLQ Kafka topic exists. Create it with longer retention if it doesn't.
+    
+    Args:
+        admin_client: Kafka AdminClient instance
+        topic_name: Name of the DLQ topic to create/verify
+        num_partitions: Number of partitions (default: 1, DLQ doesn't need parallelism)
+        replication_factor: Replication factor (default: 1 for single broker)
+    """
+    try:
+        # Get existing topics
+        metadata = admin_client.list_topics(timeout=10)
+        existing_topics = metadata.topics
+        
+        if topic_name in existing_topics:
+            print(f"[Producer] DLQ Topic '{topic_name}' already exists")
+            return
+        
+        # Topic doesn't exist, create it
+        print(f"[Producer] Creating DLQ topic '{topic_name}' with {num_partitions} partition(s)...")
+        
+        new_topic = NewTopic(
+            topic=topic_name,
+            num_partitions=num_partitions,
+            replication_factor=replication_factor,
+            config={
+                'retention.ms': '2592000000',  # 30 days in milliseconds (longer retention for DLQ)
+                'min.insync.replicas': '1',
+            }
+        )
+        
+        # Create topic (returns a dict of futures)
+        futures = admin_client.create_topics([new_topic])
+        
+        # Wait for topic creation to complete
+        for topic, future in futures.items():
+            try:
+                future.result()  # Block until topic is created
+                print(f"[Producer] DLQ Topic '{topic}' created successfully")
+            except Exception as e:
+                print(f"[Producer] Failed to create DLQ topic '{topic}': {e}")
+                raise
+                
+    except Exception as e:
+        print(f"[Producer] Error ensuring DLQ topic exists: {e}")
+        raise
+
+
 def init_kafka_producer():
     """Initialize Kafka producer and schema registry client."""
     global kafka_producer, schema_registry_client, avro_serializer
     
     try:
-        # Initialize AdminClient first to check/create topic
+        # Initialize AdminClient first to check/create topics
         admin_client = AdminClient({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS})
         
-        # Ensure topic exists with proper configuration
+        # Ensure main topic exists with proper configuration
         ensure_topic_exists(admin_client, ORDER_TOPIC, num_partitions=3, replication_factor=1)
+        
+        # Create DLQ topic with longer retention (30 days)
+        ensure_topic_exists_dlq(admin_client, DLQ_TOPIC, num_partitions=1, replication_factor=1)
         
         # Initialize Schema Registry client
         schema_registry_client = SchemaRegistryClient({
@@ -311,6 +365,114 @@ def validate_update_request(body: UpdateOrderRequest) -> None:
             status_code=400,
             detail="Invalid value: 'status' must be a non-empty string (cannot be empty or only whitespace).",
         )
+    
+    # Prevent status="new" in updates (that's for creation only)
+    if status.lower() == "new":
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid value: 'status' cannot be 'new' for update operations. Status 'new' is reserved for order creation. Use statuses like 'pending', 'confirmed', 'shipped', 'delivered', or 'cancelled'.",
+        )
+
+
+def publish_update_event(update: dict):
+    """
+    Publish a status update event to Kafka.
+    Since Avro requires all fields, we create a minimal valid message with placeholders.
+    The consumer will recognize this as an update (status != 'new') and merge with existing data.
+    
+    Raises:
+        HTTPException(400): For data/serialization errors
+        HTTPException(503): For transient network/broker errors
+        HTTPException(500): For unexpected errors
+    """
+    global kafka_producer, avro_serializer
+    
+    ensure_kafka_connection()
+    
+    try:
+        # Build minimal Avro-compliant message for status update
+        # Consumer will detect this is an update based on status != "new"
+        # and merge the status with existing order data
+        order_update_message = {
+            "orderId": update["orderId"],
+            "customerId": "__UPDATE_PLACEHOLDER__",  # Placeholder - consumer will ignore
+            "orderDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "items": [],  # Empty array - consumer will ignore
+            "totalAmount": 0.0,  # Placeholder - consumer will ignore
+            "currency": "USD",  # Placeholder - consumer will ignore
+            "status": update["status"],
+        }
+        
+        # Use orderId as the key to ensure ordering per order
+        key = order_update_message["orderId"].encode('utf-8')
+        
+        # Serialize using Avro
+        try:
+            serialized_value = avro_serializer(order_update_message, SerializationContext(ORDER_TOPIC, MessageField.VALUE))
+        except (TypeError, ValueError, KeyError) as serialization_error:
+            # Data validation or schema mismatch errors
+            print(f"[Producer] Serialization error: {serialization_error}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Bad Request: Failed to serialize update data: {str(serialization_error)}"
+            )
+        except Exception as serialization_error:
+            # Other serialization errors
+            print(f"[Producer] Avro serialization error: {serialization_error}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Bad Request: Invalid update data format: {str(serialization_error)}"
+            )
+        
+        # Produce message
+        try:
+            kafka_producer.produce(
+                topic=ORDER_TOPIC,
+                key=key,
+                value=serialized_value,
+                callback=delivery_callback
+            )
+            
+            # Flush to ensure message is sent
+            kafka_producer.flush(timeout=10)
+            
+        except BufferError as buffer_error:
+            # Queue is full - transient error
+            print(f"[Producer] Buffer full error: {buffer_error}")
+            raise HTTPException(
+                status_code=503,
+                detail="Service Unavailable: Message queue is full. Please try again in a moment."
+            )
+        except KafkaException as kafka_error:
+            # Kafka-specific errors
+            error_code = kafka_error.args[0].code() if kafka_error.args else None
+            
+            # Check if it's a retriable error
+            if error_code in (KafkaError._MSG_TIMED_OUT, KafkaError.REQUEST_TIMED_OUT, 
+                             KafkaError._TRANSPORT, KafkaError.NETWORK_EXCEPTION):
+                print(f"[Producer] Transient Kafka error: {kafka_error}")
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Service Unavailable: Kafka broker temporarily unreachable. Error: {str(kafka_error)}"
+                )
+            else:
+                # Non-retriable Kafka error
+                print(f"[Producer] Kafka error: {kafka_error}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Internal error: Kafka operation failed: {str(kafka_error)}"
+                )
+        
+    except HTTPException:
+        # Re-raise HTTPExceptions as-is
+        raise
+    except Exception as e:
+        # Unexpected errors
+        print(f"[Producer] Unexpected error publishing update: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal error: An unexpected error occurred: {str(e)}"
+        )
 
 
 def publish_order_event(order: dict):
@@ -425,20 +587,22 @@ def on_shutdown():
 def create_order(body: CreateOrderRequest):
     """
     Create a new order and publish it to Kafka.
+    The order will have status='new'.
+    
+    The producer does not validate if the orderId already exists.
+    Duplicate detection is handled by the consumer (Order Service).
     """
     try:
         validate_create_request(body)
         
+        # Generate order with status="new"
         order = generate_random_order(body.orderId.strip(), body.itemsCount)
         
-        # Store order in memory for update-order endpoint
-        order_database[order["orderId"]] = order
-        
-        # Publish to Kafka
+        # Publish to Kafka (no local storage - producer is stateless)
         publish_order_event(order)
         
         return {
-            "message": "Order created and published successfully.",
+            "message": "Order creation event published successfully. The order will be validated and processed by the Order Service.",
             "order": order,
         }
         
@@ -456,33 +620,34 @@ def create_order(body: CreateOrderRequest):
 def update_order(body: UpdateOrderRequest):
     """
     Update an existing order's status and publish the update to Kafka.
+    
+    The producer does NOT validate if the order exists - it only publishes the intent.
+    The consumer (Order Service) will:
+    - If orderId doesn't exist and status != 'new' → send to DLQ (invalid update)
+    - If orderId exists and status != 'new' → merge the status update with existing order data
+    
+    Note: Only orderId and status are required. The status field must NOT be 'new'.
     """
     try:
         validate_update_request(body)
         
-        order_id = body.orderId.strip()
+        # Build minimal update event (only orderId + status)
+        # Consumer will merge this with existing order data
+        update_event = {
+            "orderId": body.orderId.strip(),
+            "status": body.status.strip(),
+        }
         
-        # Check if order exists
-        if order_id not in order_database:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Order with ID '{order_id}' not found. Cannot update non-existent order."
-            )
+        print(f"[Producer] Publishing status update event for order {update_event['orderId']} → {update_event['status']}")
         
-        # Update order status
-        order = order_database[order_id].copy()
-        order["status"] = body.status.strip()
-        order["orderDate"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())  # Update timestamp
-        
-        # Update in-memory database
-        order_database[order_id] = order
-        
-        # Publish update to Kafka
-        publish_order_event(order)
+        # Publish status update to Kafka
+        # Note: We're publishing a partial update, not a full order
+        # The consumer must handle merging this with the existing order
+        publish_update_event(update_event)
         
         return {
-            "message": "Order updated and published successfully.",
-            "order": order,
+            "message": "Order status update event published successfully. The consumer will validate and apply the update.",
+            "update": update_event,
         }
         
     except HTTPException:
