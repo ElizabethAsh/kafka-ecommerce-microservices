@@ -376,9 +376,8 @@ def validate_update_request(body: UpdateOrderRequest) -> None:
 
 def publish_update_event(update: dict):
     """
-    Publish a status update event to Kafka.
-    Since Avro requires all fields, we create a minimal valid message with placeholders.
-    The consumer will recognize this as an update (status != 'new') and merge with existing data.
+    Publish a status update event to Kafka using true Avro union.
+    Uses UPDATE event type with only necessary fields (orderId, status).
     
     Raises:
         HTTPException(400): For data/serialization errors
@@ -390,17 +389,14 @@ def publish_update_event(update: dict):
     ensure_kafka_connection()
     
     try:
-        # Build minimal Avro-compliant message for status update
-        # Consumer will detect this is an update based on status != "new"
-        # and merge the status with existing order data
+        # Build UPDATE event message using true union schema
         order_update_message = {
+            "eventType": "UPDATE",
             "orderId": update["orderId"],
-            "customerId": "__UPDATE_PLACEHOLDER__",  # Placeholder - consumer will ignore
-            "orderDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "items": [],  # Empty array - consumer will ignore
-            "totalAmount": 0.0,  # Placeholder - consumer will ignore
-            "currency": "USD",  # Placeholder - consumer will ignore
-            "status": update["status"],
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "payload": {
+                "status": update["status"]
+            }
         }
         
         # Use orderId as the key to ensure ordering per order
@@ -477,7 +473,8 @@ def publish_update_event(update: dict):
 
 def publish_order_event(order: dict):
     """
-    Publish order event to Kafka using Avro serialization.
+    Publish order CREATE event to Kafka using true Avro union.
+    Wraps the order data in CREATE event type within the payload union.
     
     Raises:
         HTTPException(400): For data/serialization errors
@@ -489,12 +486,27 @@ def publish_order_event(order: dict):
     ensure_kafka_connection()
     
     try:
+        # Wrap order in CREATE event using true union schema
+        order_create_message = {
+            "eventType": "CREATE",
+            "orderId": order["orderId"],
+            "timestamp": order["orderDate"],  # Use order creation time as event timestamp
+            "payload": {
+                "customerId": order["customerId"],
+                "orderDate": order["orderDate"],
+                "items": order["items"],
+                "totalAmount": order["totalAmount"],
+                "currency": order["currency"],
+                "status": order["status"]
+            }
+        }
+        
         # Use orderId as the key to ensure ordering per order
-        key = order["orderId"].encode('utf-8')
+        key = order_create_message["orderId"].encode('utf-8')
         
         # Serialize order using Avro
         try:
-            serialized_value = avro_serializer(order, SerializationContext(ORDER_TOPIC, MessageField.VALUE))
+            serialized_value = avro_serializer(order_create_message, SerializationContext(ORDER_TOPIC, MessageField.VALUE))
         except (TypeError, ValueError, KeyError) as serialization_error:
             # Data validation or schema mismatch errors
             print(f"[Producer] Serialization error: {serialization_error}")

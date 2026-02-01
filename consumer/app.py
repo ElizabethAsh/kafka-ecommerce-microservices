@@ -322,11 +322,11 @@ def calculate_shipping(total: float) -> float:
 def process_with_retry(msg, order_data: dict, order_id: str) -> bool:
     """
     Process order message with retry logic and exponential backoff.
-    Handles both full order creation and status-only updates.
+    Handles both CREATE and UPDATE event types using true Avro union.
     
     Args:
         msg: Original Kafka message
-        order_data: Deserialized order data
+        order_data: Deserialized order data with true union schema
         order_id: Order ID from the message
         
     Returns:
@@ -336,44 +336,53 @@ def process_with_retry(msg, order_data: dict, order_id: str) -> bool:
     
     while retry_count <= MAX_RETRIES:
         try:
-            # Detect if this is a status-only update (minimal message from producer)
-            # Status-only updates have empty items array and status != "new"
-            is_status_update = (
-                len(order_data.get("items", [])) == 0 and 
-                order_data.get("status", "") != "new" and
-                order_data.get("customerId", "") == "__UPDATE_PLACEHOLDER__"
-            )
+            event_type = order_data.get("eventType")
+            payload = order_data.get("payload")
             
             with db_lock:
-                if is_status_update and order_id in order_database:
-                    # Status-only update: merge new status with existing order
-                    existing_order = order_database[order_id]
-                    existing_order["status"] = order_data.get("status")
-                    existing_order["orderDate"] = order_data.get("orderDate")  # Update timestamp
-                    
-                    print(f"[Consumer] Status update applied to order {order_id}: status={existing_order['status']}")
-                    print(f"[Consumer] Existing order data preserved (items, amounts, customer, shipping, etc.)")
-                    
-                    # Track orderId per topic
-                    topic_name = msg.topic()
-                    if topic_name not in topic_order_ids:
-                        topic_order_ids[topic_name] = set()
-                    topic_order_ids[topic_name].add(order_id)
-                    
-                    return True
+                if event_type == "UPDATE":
+                    # Handle UPDATE event - payload IS UpdateOrderPayload
+                    if order_id in order_database:
+                        update_payload = payload  # payload is directly UpdateOrderPayload
+                        existing_order = order_database[order_id]
+                        existing_order["status"] = update_payload["status"]
+                        existing_order["orderDate"] = order_data.get("timestamp")  # Use event timestamp
+                        
+                        print(f"[Consumer] UPDATE event processed for order {order_id}: status={existing_order['status']}")
+                        print(f"[Consumer] Existing order data preserved (items, amounts, customer, shipping, etc.)")
+                        
+                        # Track orderId per topic
+                        topic_name = msg.topic()
+                        if topic_name not in topic_order_ids:
+                            topic_order_ids[topic_name] = set()
+                        topic_order_ids[topic_name].add(order_id)
+                        
+                        return True
+                    else:
+                        # UPDATE for non-existent order - should have been caught earlier
+                        raise ValueError(f"UPDATE event for non-existent order {order_id}")
                 
-                else:
-                    # Full order creation: process normally
-                    order_total = order_data.get("totalAmount")
+                elif event_type == "CREATE":
+                    # Handle CREATE event - payload IS CreateOrderPayload
+                    create_payload = payload  # payload is directly CreateOrderPayload
+                    order_total = create_payload.get("totalAmount")
                     
                     # Calculate shipping cost (2% of total)
                     shipping = calculate_shipping(float(order_total))
                     
-                    # Add shipping cost to order data
-                    order_with_shipping = dict(order_data)
-                    order_with_shipping["shippingCost"] = shipping
+                    # Build complete order with shipping cost
+                    order_with_shipping = {
+                        "orderId": order_id,
+                        "customerId": create_payload["customerId"],
+                        "orderDate": create_payload["orderDate"],
+                        "items": create_payload["items"],
+                        "totalAmount": create_payload["totalAmount"],
+                        "currency": create_payload["currency"],
+                        "status": create_payload["status"],
+                        "shippingCost": shipping
+                    }
                     
-                    # Store in memory (replaces existing order if any)
+                    # Store in memory
                     order_database[order_id] = order_with_shipping
                     
                     # Track orderId per topic
@@ -382,8 +391,11 @@ def process_with_retry(msg, order_data: dict, order_id: str) -> bool:
                         topic_order_ids[topic_name] = set()
                     topic_order_ids[topic_name].add(order_id)
                     
-                    print(f"[Consumer] Order {order_id} processed successfully with shipping cost ${shipping}")
+                    print(f"[Consumer] CREATE event processed for order {order_id} with shipping cost ${shipping}")
                     return True
+                
+                else:
+                    raise ValueError(f"Unknown event type: {event_type}")
             
         except Exception as process_error:
             retry_count += 1
@@ -462,8 +474,10 @@ def process_order_message():
                 kafka_consumer.commit(message=msg)
                 continue
             
-            # Get order ID
+            # Get order ID and event type (both at top level in union schema)
             order_id = order_data.get("orderId")
+            event_type = order_data.get("eventType")
+            
             if not order_id:
                 print(f"[Consumer] Validation error: Order missing orderId")
                 
@@ -478,26 +492,35 @@ def process_order_message():
                 kafka_consumer.commit(message=msg)
                 continue
             
-            # Check for duplicate CREATE request and invalid UPDATE request
-            # Duplicates: orderId exists AND status is "new" (initial creation status)
-            # Invalid UPDATE: orderId doesn't exist AND status is NOT "new"
-            order_status = order_data.get("status", "")
+            if not event_type:
+                print(f"[Consumer] Validation error: Order missing eventType")
+                
+                # Send to DLQ (data validation error - non-retriable)
+                send_to_dlq(
+                    original_message=msg,
+                    error_category=ErrorCategory.NO_RETRY_DLQ,
+                    error_message="Validation failed: Missing required field 'eventType'",
+                    retry_count=0
+                )
+                
+                kafka_consumer.commit(message=msg)
+                continue
             
+            # Check for duplicate CREATE request and invalid UPDATE request
+            # Using union schema eventType instead of status field
             with db_lock:
                 order_exists = order_id in order_database
             
-            # Case 1: Duplicate CREATE (order exists + status="new")
-            if order_exists and order_status == "new":
-                print(f"[Consumer] Duplicate CREATE detected: {order_id} already exists with status='new'")
+            # Case 1: Duplicate CREATE (order exists + eventType="CREATE")
+            if order_exists and event_type == "CREATE":
+                print(f"[Consumer] Duplicate CREATE detected: {order_id} already exists")
                 print(f"[Consumer] This appears to be a duplicate create-order request, not an update")
                 
                 # Send to DLQ (duplicate CREATE - non-retriable)
                 send_to_dlq(
                     original_message=msg,
                     error_category=ErrorCategory.NO_RETRY_DLQ,
-                    error_message=f"Duplicate CREATE request: Order with ID '{order_id}' already exists in the system, "
-                                 f"and incoming message has status='new' (initial creation status). "
-                                 f"This is likely a duplicate create-order request. "
+                    error_message=f"Duplicate CREATE request: Order with ID '{order_id}' already exists in the system. "
                                  f"Use PUT /update-order endpoint to modify existing orders.",
                     retry_count=0
                 )
@@ -505,18 +528,18 @@ def process_order_message():
                 kafka_consumer.commit(message=msg)
                 continue
             
-            # Case 2: Invalid UPDATE (order doesn't exist + status!="new")
-            elif not order_exists and order_status != "new":
-                print(f"[Consumer] Invalid UPDATE detected: {order_id} doesn't exist but received status='{order_status}'")
+            # Case 2: Invalid UPDATE (order doesn't exist + eventType="UPDATE")
+            elif not order_exists and event_type == "UPDATE":
+                print(f"[Consumer] Invalid UPDATE detected: {order_id} doesn't exist but received UPDATE event")
                 print(f"[Consumer] UPDATE messages should only be sent for existing orders")
                 
                 # Send to DLQ (invalid UPDATE - non-retriable)
                 send_to_dlq(
                     original_message=msg,
                     error_category=ErrorCategory.NO_RETRY_DLQ,
-                    error_message=f"Invalid UPDATE request: Received status='{order_status}' for order '{order_id}' "
+                    error_message=f"Invalid UPDATE request: Received UPDATE event for order '{order_id}' "
                                  f"which doesn't exist in the system. "
-                                 f"Orders must be created first with status='new' (via POST /create-order) "
+                                 f"Orders must be created first (via POST /create-order) "
                                  f"before they can be updated.",
                     retry_count=0
                 )
@@ -524,54 +547,80 @@ def process_order_message():
                 kafka_consumer.commit(message=msg)
                 continue
             
-            # Case 3: Valid UPDATE (order exists + status!="new")
-            elif order_exists:
-                print(f"[Consumer] Update detected for {order_id}: status='{order_status}' (not 'new', so treating as update)")
-                # Continue processing - might be status-only update or full update
+            # Case 3: Valid UPDATE (order exists + eventType="UPDATE")
+            elif order_exists and event_type == "UPDATE":
+                print(f"[Consumer] Valid UPDATE event detected for existing order {order_id}")
+                # Continue processing
             
             # Case 4: Valid CREATE (order doesn't exist + status="new")
             # Just continue processing
             
-            # Detect if this is a status-only update (minimal message)
-            is_status_update = (
-                len(order_data.get("items", [])) == 0 and 
-                order_status != "new" and
-                order_data.get("customerId", "") == "__UPDATE_PLACEHOLDER__"
-            )
+            # Validate payload field exists
+            payload = order_data.get("payload")
+            if not payload:
+                print(f"[Consumer] Validation error: Event missing payload")
+                send_to_dlq(
+                    original_message=msg,
+                    error_category=ErrorCategory.NO_RETRY_DLQ,
+                    error_message="Validation failed: Event missing 'payload' field",
+                    retry_count=0
+                )
+                kafka_consumer.commit(message=msg)
+                continue
             
-            # Validate totalAmount (skip for status-only updates)
-            if not is_status_update:
-                order_total = order_data.get("totalAmount")
+            # Validate based on event type using true union schema
+            if event_type == "CREATE":
+                create_payload = payload  # payload IS CreateOrderPayload
+                
+                # Validate required fields
+                order_total = create_payload.get("totalAmount")
                 if not isinstance(order_total, (int, float)):
-                    print(f"[Consumer] Validation error: Invalid totalAmount in order {order_id}")
-                    
-                    # Send to DLQ (data validation error - non-retriable)
+                    print(f"[Consumer] Validation error: Invalid totalAmount in CREATE event")
                     send_to_dlq(
                         original_message=msg,
                         error_category=ErrorCategory.NO_RETRY_DLQ,
                         error_message=f"Validation failed: Invalid totalAmount type (expected number, got {type(order_total).__name__})",
                         retry_count=0
                     )
-                    
                     kafka_consumer.commit(message=msg)
                     continue
             
-            # Log order details
-            if is_status_update:
-                print(f"[Consumer] Received STATUS UPDATE event:")
+            elif event_type == "UPDATE":
+                update_payload = payload  # payload IS UpdateOrderPayload
+                
+                # Validate status field exists
+                if not update_payload.get("status"):
+                    print(f"[Consumer] Validation error: UPDATE event missing status")
+                    send_to_dlq(
+                        original_message=msg,
+                        error_category=ErrorCategory.NO_RETRY_DLQ,
+                        error_message="Validation failed: UPDATE event payload missing 'status' field",
+                        retry_count=0
+                    )
+                    kafka_consumer.commit(message=msg)
+                    continue
+            
+            # Log order details based on event type
+            event_timestamp = order_data.get("timestamp", "N/A")
+            
+            if event_type == "UPDATE":
+                update_payload = payload  # payload IS UpdateOrderPayload
+                print(f"[Consumer] Received UPDATE event:")
                 print(f"  Order ID: {order_id}")
-                print(f"  New Status: {order_data.get('status', 'N/A')}")
-                print(f"  Update Time: {order_data.get('orderDate', 'N/A')}")
+                print(f"  New Status: {update_payload.get('status', 'N/A')}")
+                print(f"  Event Timestamp: {event_timestamp}")
                 print(f"  Topic: {msg.topic()}")
                 print(f"  Partition: {msg.partition()}, Offset: {msg.offset()}")
-            else:
-                print(f"[Consumer] Received FULL ORDER event:")
+            elif event_type == "CREATE":
+                create_payload = payload  # payload IS CreateOrderPayload
+                print(f"[Consumer] Received CREATE event:")
                 print(f"  Order ID: {order_id}")
-                print(f"  Customer ID: {order_data.get('customerId', 'N/A')}")
-                print(f"  Order Date: {order_data.get('orderDate', 'N/A')}")
-                print(f"  Total Amount: ${order_data.get('totalAmount', 0)}")
-                print(f"  Number of Items: {len(order_data.get('items', []))}")
-                print(f"  Status: {order_data.get('status', 'N/A')}")
+                print(f"  Customer ID: {create_payload.get('customerId', 'N/A')}")
+                print(f"  Order Date: {create_payload.get('orderDate', 'N/A')}")
+                print(f"  Total Amount: ${create_payload.get('totalAmount', 0)}")
+                print(f"  Number of Items: {len(create_payload.get('items', []))}")
+                print(f"  Status: {create_payload.get('status', 'N/A')}")
+                print(f"  Event Timestamp: {event_timestamp}")
                 print(f"  Topic: {msg.topic()}")
                 print(f"  Partition: {msg.partition()}, Offset: {msg.offset()}")
             

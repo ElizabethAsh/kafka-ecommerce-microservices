@@ -1,65 +1,105 @@
 {
   "type": "record",
-  "name": "Order",
+  "name": "OrderEvent",
   "namespace": "com.ecommerce.order",
+  "doc": "Event wrapper for order-related events using true Avro union",
   "fields": [
+    {
+      "name": "eventType",
+      "type": {
+        "type": "enum",
+        "name": "EventType",
+        "symbols": ["CREATE", "UPDATE"]
+      },
+      "doc": "Type of order event"
+    },
     {
       "name": "orderId",
       "type": "string",
-      "doc": "Unique identifier for the order"
+      "doc": "Unique identifier for the order (used for Kafka partitioning and routing)"
     },
     {
-      "name": "customerId",
+      "name": "timestamp",
       "type": "string",
-      "doc": "Unique identifier for the customer"
+      "doc": "Event timestamp in ISO 8601 format"
     },
     {
-      "name": "orderDate",
-      "type": "string",
-      "doc": "Timestamp in ISO 8601 format"
-    },
-    {
-      "name": "items",
-      "type": {
-        "type": "array",
-        "items": {
+      "name": "payload",
+      "type": [
+        {
           "type": "record",
-          "name": "OrderItem",
+          "name": "CreateOrderPayload",
+          "doc": "Payload for CREATE order events",
           "fields": [
             {
-              "name": "itemId",
+              "name": "customerId",
               "type": "string",
-              "doc": "Unique identifier for the item"
+              "doc": "Unique identifier for the customer"
             },
             {
-              "name": "quantity",
-              "type": "int",
-              "doc": "Quantity of the item (must be greater than 0)"
+              "name": "orderDate",
+              "type": "string",
+              "doc": "Order creation date in ISO 8601 format"
             },
             {
-              "name": "price",
+              "name": "items",
+              "type": {
+                "type": "array",
+                "items": {
+                  "type": "record",
+                  "name": "OrderItem",
+                  "fields": [
+                    {
+                      "name": "itemId",
+                      "type": "string",
+                      "doc": "Unique identifier for the item"
+                    },
+                    {
+                      "name": "quantity",
+                      "type": "int",
+                      "doc": "Quantity of the item"
+                    },
+                    {
+                      "name": "price",
+                      "type": "double",
+                      "doc": "Price per unit"
+                    }
+                  ]
+                }
+              },
+              "doc": "Array of order items"
+            },
+            {
+              "name": "totalAmount",
               "type": "double",
-              "doc": "Price of a single unit of the item"
+              "doc": "Total cost of the order"
+            },
+            {
+              "name": "currency",
+              "type": "string",
+              "doc": "Currency code (e.g., USD, EUR)"
+            },
+            {
+              "name": "status",
+              "type": "string",
+              "doc": "Initial status of the order (should be 'new' for CREATE)"
+            }
+          ]
+        },
+        {
+          "type": "record",
+          "name": "UpdateOrderPayload",
+          "doc": "Payload for UPDATE order events",
+          "fields": [
+            {
+              "name": "status",
+              "type": "string",
+              "doc": "New status for the order"
             }
           ]
         }
-      },
-      "doc": "Array of order items"
-    },
-    {
-      "name": "totalAmount",
-      "type": "double",
-      "doc": "Total cost of the order (must equal the sum of item prices * quantities)"
-    },
-    {
-      "name": "currency",
-      "type": "string",
-      "doc": "Currency code (e.g., USD, EUR)"
-    },
-    {
-      "name": "status",
-      "type": "string",
-      "doc": "Status of the order (e.g., 'pending', 'confirmed', 'shipped', 'delivered', 'cancelled')"
+      ],
+      "doc": "Event payload - union of different event types. Only one type is present per event."
     }
   ]
 }

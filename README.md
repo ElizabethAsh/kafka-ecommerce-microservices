@@ -36,13 +36,16 @@ The system uses **2 Kafka topics**:
 ### **1. `order-events`**
 - **Purpose**: Main topic for all order-related events
 - **Used by**: 
-  - **Producer**: Publishes all order events (both create and update operations)
+  - **Producer**: Publishes all order events (both CREATE and UPDATE operations)
   - **Consumer**: Subscribes to receive and process all order events
 - **Configuration**:
   - Partitions: 3 (for parallelism)
   - Replication Factor: 1
   - Retention: 7 days (604800000 ms)
   - Message Key: `orderId` (ensures ordering per order)
+- **Message Format**: Uses **Avro Union Schema** with two event types:
+  - **CREATE**: Contains full order data (customerId, items, totalAmount, etc.)
+  - **UPDATE**: Contains only orderId and new status (efficient updates)
 
 ### **2. `order-events-dlq`**
 - **Purpose**: Dead Letter Queue for failed messages
@@ -79,11 +82,82 @@ The system uses **2 Kafka topics**:
 
 ---
 
-## 5. Error Handling Approaches
+## 5. Avro True Union Schema Design
+
+The system uses **Avro True Union Schema** to elegantly handle different event types (CREATE and UPDATE) in the same topic with maximum efficiency.
+
+### **Schema Structure:**
+```json
+{
+  "eventType": "CREATE" or "UPDATE",
+  "orderId": "ORDER-123",
+  "timestamp": "2026-01-30T15:00:00Z",
+  "payload": {
+    "CreateOrderPayload": { /* full order data */ }
+    OR
+    "UpdateOrderPayload": { /* status only */ }
+  }
+}
+```
+
+### **Key Design Principles:**
+✅ **No Data Duplication**: `orderId` appears only at top level (not inside payload)  
+✅ **No Null Fields**: Union ensures only relevant payload is present (no unused fields)  
+✅ **Event Timestamp**: Every event has a timestamp for audit trail  
+✅ **Type Safety**: Avro enforces structure at serialization time  
+✅ **Efficiency**: UPDATE events are ~95% smaller (only status vs. full order)  
+✅ **Extensibility**: Easy to add new event types (e.g., DELETE, CANCEL)  
+
+### **CREATE Event Example:**
+```json
+{
+  "eventType": "CREATE",
+  "orderId": "ORDER-001",
+  "timestamp": "2026-01-30T15:00:00Z",
+  "payload": {
+    "CreateOrderPayload": {
+      "customerId": "CUST-123",
+      "orderDate": "2026-01-30T15:00:00Z",
+      "items": [
+        {
+          "itemId": "ITEM-456",
+          "quantity": 2,
+          "price": 49.99
+        }
+      ],
+      "totalAmount": 99.98,
+      "currency": "USD",
+      "status": "new"
+    }
+  }
+}
+```
+**Size**: ~500 bytes  
+**Note**: No `UpdateOrderPayload` field - union means only one type present
+
+### **UPDATE Event Example:**
+```json
+{
+  "eventType": "UPDATE",
+  "orderId": "ORDER-001",
+  "timestamp": "2026-01-30T16:00:00Z",
+  "payload": {
+    "UpdateOrderPayload": {
+      "status": "shipped"
+    }
+  }
+}
+```
+**Size**: ~50 bytes (90% smaller than CREATE!)  
+**Note**: No `CreateOrderPayload` field - true union efficiency
+
+---
+
+## 6. Error Handling Approaches
 
 The implementation uses a **multi-layered error handling strategy** with 7 distinct approaches:
 
-### **5.1 Retry Logic with Exponential Backoff**
+### **6.1 Retry Logic with Exponential Backoff**
 
 **Purpose**: Handle transient failures (network issues, broker temporarily down)
 
@@ -115,7 +189,7 @@ Attempt 4: Success! ✅
 
 ---
 
-### **5.2 Try-Catch Blocks for Expected Exceptions**
+### **6.2 Try-Catch Blocks for Expected Exceptions**
 
 **Purpose**: Handle known failure modes gracefully (schema errors, serialization issues)
 
@@ -145,7 +219,7 @@ except Exception as deserialize_err:
 
 ---
 
-### **5.3 Dead Letter Queue (DLQ) Pattern**
+### **6.3 Dead Letter Queue (DLQ) Pattern**
 
 **Purpose**: Preserve messages that cannot be processed for later analysis/retry
 
@@ -196,7 +270,7 @@ GET http://localhost:8001/dlq/messages?limit=10
 
 ---
 
-### **5.4 Input Validation**
+### **6.4 Input Validation**
 
 **Purpose**: Prevent invalid data from entering the system
 
@@ -242,7 +316,7 @@ def validate_update_request(body: UpdateOrderRequest):
 
 ---
 
-### **5.5 HTTP Status Code Differentiation**
+### **6.5 HTTP Status Code Differentiation**
 
 **Purpose**: Communicate error type clearly to API consumers
 
@@ -278,7 +352,7 @@ raise HTTPException(status_code=503, detail="Kafka broker unreachable")
 
 ---
 
-### **5.6 Comprehensive Logging**
+### **6.6 Comprehensive Logging**
 
 **Purpose**: Debugging, monitoring, and audit trail
 
@@ -323,7 +397,7 @@ docker logs order-service-consumer | grep "DLQ"
 
 ---
 
-### **5.7 Graceful Degradation**
+### **6.7 Graceful Degradation**
 
 **Purpose**: System continues operating even when individual components fail
 
@@ -397,7 +471,7 @@ def create_order(body: CreateOrderRequest):
 
 ---
 
-## 6. Architecture Overview
+## 7. Architecture Overview
 
 ### **Event Flow Diagram:**
 ```
@@ -472,7 +546,7 @@ def create_order(body: CreateOrderRequest):
 
 ---
 
-## 7. API Endpoints
+## 8. API Endpoints
 
 ### **Producer (Cart Service) - Port 8000**
 
@@ -618,7 +692,7 @@ Response (200):
 
 ---
 
-## 8. Testing Scenarios
+## 9. Testing Scenarios
 
 ### **Scenario 1: Happy Path - Create and Update**
 ```bash
@@ -694,7 +768,7 @@ curl -X PUT http://localhost:8000/update-order \
 
 ---
 
-## 9. Running the Application
+## 10. Running the Application
 
 ### **Prerequisites**
 - Docker and Docker Compose installed
@@ -729,7 +803,7 @@ docker-compose up --build -d
 
 ---
 
-## 10. Technology Stack
+## 11. Technology Stack
 
 - **Language**: Python 3.11
 - **Framework**: FastAPI (async web framework)
@@ -741,7 +815,7 @@ docker-compose up --build -d
 
 ---
 
-## 11. Project Structure
+## 12. Project Structure
 
 ```
 task2/
@@ -761,7 +835,7 @@ task2/
 
 ---
 
-## 12. Key Learnings and Best Practices
+## 13. Key Learnings and Best Practices
 
 ### **Event-Driven Architecture**
 ✅ **Decoupling**: Producer and consumer are independent services  
@@ -791,7 +865,7 @@ task2/
 
 ---
 
-## 13. Future Improvements
+## 14. Future Improvements
 
 If this were a production system, consider:
 
