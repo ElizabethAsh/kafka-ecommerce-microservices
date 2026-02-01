@@ -11,10 +11,10 @@
 
 ## 2. Topic Names
 
-| Topic Name | Purpose |
-|------------|---------|
-| **order-events** | Main event topic containing all order events (CREATE and UPDATE) using Avro Union schema for type-safe event processing |
-| **order-events-dlq** | Dead Letter Queue for failed messages after 3 retries with exponential backoff. Contains enriched metadata for debugging |
+| Topic Name | Purpose | Used By |
+|------------|---------|---------|
+| **order-events** | Main event topic containing all order events (CREATE and UPDATE) using Avro Union schema for type-safe event processing | Producer (publishes) / Consumer (consumes) |
+| **order-events-dlq** | Dead Letter Queue for failed messages after 3 retries with exponential backoff. Contains enriched metadata for debugging | Consumer (publishes failed messages and monitors) |
 
 ---
 
@@ -31,6 +31,8 @@
 ---
 
 ## 4. Error Handling
+
+**Note:** Errors are handled at multiple layers (Producer, Consumer, Kafka level) to ensure data integrity, fault isolation, and continued system availability without message loss.
 
 ### Dead Letter Queue (DLQ)
 - Failed messages sent to `order-events-dlq` after 3 retries
@@ -102,11 +104,6 @@
 ## 7. Running the System
 
 ```bash
-# Start all services
-docker-compose -f docker-compose.yml up -d
-
-# Or pull from Docker Hub and start
-docker-compose -f docker-compose.yml pull
 docker-compose -f docker-compose.yml up -d
 ```
 
@@ -177,10 +174,3 @@ curl http://localhost:8001/health
 
 ---
 
-## 9. Technology Stack
-
-- **Python 3.11** with FastAPI
-- **Apache Kafka** (Confluent Platform 7.5.0)
-- **Confluent Schema Registry** for Avro schemas
-- **Docker & Docker Compose** for containerization
-- **Avro Serialization** (`confluent-kafka[avro]`)
