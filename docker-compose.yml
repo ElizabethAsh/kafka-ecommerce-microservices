@@ -67,9 +67,7 @@ services:
 
   # Producer Application (Cart Service)
   producer:
-    build:
-      context: ./producer
-      dockerfile: Dockerfile
+    image: elizabeth496/task2-producer:latest
     container_name: cart-service-producer
     depends_on:
       kafka:
@@ -89,9 +87,7 @@ services:
 
   # Consumer Application (Order Service)
   consumer:
-    build:
-      context: ./consumer
-      dockerfile: Dockerfile
+    image: elizabeth496/task2-consumer:latest
     container_name: order-service-consumer
     depends_on:
       kafka:
